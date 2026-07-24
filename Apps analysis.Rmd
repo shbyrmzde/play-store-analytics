@@ -1,0 +1,433 @@
+---
+title: "Play Store Apps Anlaysis"
+author: "Shalala Bayramova"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+## Setup
+
+```{r setup ,error=FALSE, message=FALSE,warning=FALSE, echo=TRUE}
+
+pacman::p_load(data.table,dplyr,readxl,readr,tidyr,lubridate,xlsx,httr,stringr,RODBC,RMariaDB,jsonlite,ssh,stringdist,reshape2,plotly,               shiny,shinythemes,shinydashboard,shinyWidgets,knitr,rmarkdown,evaluate,base64enc,digest,highr,htmltools,xfun,yaml,mime,dplyr)
+
+ps <- read.csv("C:/Users/Nataq/OneDrive/Desktop/Apps/google_play_store_dataset.csv")
+
+```
+
+
+
+## Cleaning
+
+
+```{r clean ,error=FALSE, message=FALSE,warning=FALSE, echo=TRUE}
+
+
+```
+
+
+
+## 
+
+```{r ,error=FALSE, message=FALSE,warning=FALSE, echo=TRUE}
+
+## ================================================================
+## SETUP
+## ================================================================
+
+# Set locale to English so date parsing (month names) works correctly
+Sys.setlocale("LC_TIME", "English")
+
+pacman::p_load(data.table, dplyr, readxl, readr, lubridate, xlsx, httr, stringr,
+                RODBC, RMariaDB, jsonlite, ssh, stringdist, reshape2, plotly,
+                shiny, shinythemes, shinydashboard, shinyWidgets, knitr, rmarkdown,
+                evaluate, base64enc, digest, highr, htmltools, xfun, yaml, mime,
+                tidyr, DT)
+
+ps <- read.csv("C:/Users/Nataq/OneDrive/Desktop/Apps/google_play_store_dataset.csv")
+
+
+## ================================================================
+## APP COLUMN CLEANING
+## ================================================================
+
+ps_clean <- ps
+
+# whitespace
+ps_clean$App <- str_squish(ps_clean$App)
+
+# remove stray quote characters
+ps_clean$App <- str_remove_all(ps_clean$App, '"')
+
+# Reviews to numeric (needed for correct sorting during dedup)
+ps_clean$Reviews <- as.numeric(ps_clean$Reviews)
+sum(is.na(ps_clean$Reviews))
+
+# removing duplicates
+sum(duplicated(ps_clean$App))
+
+ps_clean %>%
+  count(App, sort = TRUE) %>%
+  filter(n > 1) %>%
+  head(20) %>%
+  knitr::kable(caption = "The Most Repeated Apps")
+
+ps_clean <- ps_clean %>%
+  arrange(App, desc(Reviews)) %>%
+  distinct(App, .keep_all = TRUE)
+
+nrow(ps)                        # row count: before
+nrow(ps_clean)                  # row count: after
+sum(duplicated(ps_clean$App))
+
+# empty app names
+sum(ps_clean$App == "" | is.na(ps_clean$App))
+ps_clean %>% filter(App == "" | is.na(App))
+
+# encoding check
+ps_clean %>%
+  filter(str_detect(App, "[^\x01-\x7F]")) %>%
+  select(App) %>%
+  distinct() %>%
+  head(20)
+
+# app name length
+ps_clean <- ps_clean %>%
+  mutate(App_Name_Length = nchar(App))
+
+ps_clean %>%
+  arrange(desc(App_Name_Length)) %>%
+  select(App, App_Name_Length) %>%
+  head(10)
+
+
+## ================================================================
+## CATEGORY COLUMN CLEANING
+## ================================================================
+
+# format check - find scrolling/misaligned row
+ps_clean %>% filter(!str_detect(Category, "^[A-Z_]+$"))
+
+ps_clean <- ps_clean %>% filter(str_detect(Category, "^[A-Z_]+$"))
+
+# whitespace
+ps_clean$Category <- str_trim(ps_clean$Category)
+
+# NA/empty values
+sum(is.na(ps_clean$Category) | ps_clean$Category == "")
+
+# unique categories
+unique(ps_clean$Category)
+table(ps_clean$Category)
+
+
+## ================================================================
+## RATING COLUMN CLEANING
+## ================================================================
+
+class(ps_clean$Rating)
+
+# range check (must be between 0-5)
+summary(ps_clean$Rating)
+ps_clean %>% filter(Rating > 5 | Rating < 0)
+
+# fix NaN values (literal "NaN" strings parsed as NaN, not NA)
+sum(is.nan(ps_clean$Rating))
+ps_clean$Rating[is.nan(ps_clean$Rating)] <- NA
+
+# NA count & rate
+sum(is.na(ps_clean$Rating))
+mean(is.na(ps_clean$Rating)) * 100
+
+# new column with category-median imputation
+ps_clean <- ps_clean %>%
+  group_by(Category) %>%
+  mutate(Rating_imputed = ifelse(is.na(Rating), median(Rating, na.rm = TRUE), Rating)) %>%
+  ungroup()
+
+sum(is.na(ps_clean$Rating_imputed))
+
+
+## ================================================================
+## SIZE COLUMN CLEANING
+## ================================================================
+
+class(ps_clean$Size)
+unique(ps_clean$Size) %>% head(20)
+sum(ps_clean$Size == "Varies with device")
+
+ps_clean <- ps_clean %>%
+  mutate(
+    Size_MB = case_when(
+      str_detect(Size, "M$") ~ as.numeric(str_remove(Size, "M")),
+      str_detect(Size, "k$") ~ as.numeric(str_remove(Size, "k")) / 1024,
+      TRUE ~ NA_real_
+    ),
+    Size_Varies = Size == "Varies with device"
+  )
+
+summary(ps_clean$Size_MB)
+sum(is.na(ps_clean$Size_MB))
+mean(is.na(ps_clean$Size_MB)) * 100
+
+
+## ================================================================
+## INSTALLS COLUMN CLEANING
+## ================================================================
+
+class(ps_clean$Installs)
+unique(ps_clean$Installs)
+
+ps_clean <- ps_clean %>%
+  mutate(Installs_num = str_remove_all(Installs, "[,+]") %>% as.numeric())
+
+summary(ps_clean$Installs_num)
+sum(is.na(ps_clean$Installs_num))
+
+
+## ================================================================
+## REVIEWS - LOGICAL CONSISTENCY CHECK (needs Installs_num, run here)
+## ================================================================
+
+class(ps_clean$Reviews)
+summary(ps_clean$Reviews)
+
+# negative values
+ps_clean %>% filter(Reviews < 0)
+
+# missing values
+sum(is.na(ps_clean$Reviews))
+ps_clean %>% filter(is.na(Reviews))
+
+# extreme values
+ps_clean %>% arrange(desc(Reviews)) %>% select(App, Reviews) %>% head(10)
+ps_clean %>% arrange(Reviews) %>% select(App, Reviews) %>% head(10)
+
+# logical consistency: reviews should not exceed installs
+ps_clean %>% filter(Reviews > Installs_num) %>% select(App, Reviews, Installs_num)
+
+
+## ================================================================
+## TYPE COLUMN CLEANING
+## ================================================================
+
+class(ps_clean$Type)
+table(ps_clean$Type, useNA = "always")
+
+# missing values
+ps_clean %>% filter(is.na(Type)) %>% select(App, Type, Price)
+
+# fix missing values using Price (robust to "$0" or "0")
+ps_clean <- ps_clean %>%
+  mutate(Type = case_when(
+    is.na(Type) & str_detect(Price, "^\\$?0$") ~ "Free",
+    is.na(Type) & !str_detect(Price, "^\\$?0$") ~ "Paid",
+    TRUE ~ Type
+  ))
+
+# to factor
+ps_clean$Type <- factor(ps_clean$Type, levels = c("Free", "Paid"))
+
+table(ps_clean$Type, useNA = "always")
+
+
+## ================================================================
+## PRICE COLUMN CLEANING
+## ================================================================
+
+class(ps_clean$Price)
+unique(ps_clean$Price) %>% head(20)
+
+ps_clean <- ps_clean %>%
+  mutate(Price_num = str_remove(Price, "\\$") %>% as.numeric())
+
+summary(ps_clean$Price_num)
+sum(is.na(ps_clean$Price_num))
+
+# outliers
+ps_clean %>% arrange(desc(Price_num)) %>% select(App, Price_num) %>% head(10)
+
+# logical consistency with Type
+ps_clean %>%
+  filter((Type == "Free" & Price_num > 0) | (Type == "Paid" & Price_num == 0)) %>%
+  select(App, Type, Price_num)
+
+
+## ================================================================
+## CONTENT.RATING COLUMN CLEANING
+## ================================================================
+
+class(ps_clean$Content.Rating)
+unique(ps_clean$Content.Rating)
+
+# missing values
+sum(is.na(ps_clean$Content.Rating) | ps_clean$Content.Rating == "")
+
+# whitespace
+ps_clean$Content.Rating <- str_trim(ps_clean$Content.Rating)
+
+# to ordered factor
+ps_clean <- ps_clean %>%
+  mutate(Content.Rating = factor(Content.Rating,
+                                   levels = c("Everyone", "Everyone 10+",
+                                              "Teen", "Mature 17+",
+                                              "Adults only 18+", "Unrated"),
+                                   ordered = TRUE))
+
+table(ps_clean$Content.Rating, useNA = "always")
+
+
+## ================================================================
+## GENRES COLUMN CLEANING
+## ================================================================
+
+class(ps_clean$Genres)
+length(unique(ps_clean$Genres))
+
+# missing values
+sum(is.na(ps_clean$Genres) | ps_clean$Genres == "")
+
+# whitespace
+ps_clean$Genres <- str_trim(ps_clean$Genres)
+
+# multi-genre apps
+sum(str_detect(ps_clean$Genres, ";"))
+
+# primary genre
+ps_clean <- ps_clean %>%
+  mutate(Primary_Genre = str_split(Genres, ";", simplify = TRUE)[, 1])
+
+length(unique(ps_clean$Primary_Genre))
+table(ps_clean$Primary_Genre) %>% sort(decreasing = TRUE) %>% head(10)
+
+# long format for multi-genre analysis (separate object, not overwriting ps_clean)
+ps_genres_long <- ps_clean %>% separate_rows(Genres, sep = ";")
+
+
+## ================================================================
+## LAST.UPDATED COLUMN CLEANING
+## ================================================================
+
+class(ps$Last.Updated)
+head(unique(ps$Last.Updated), 10)
+
+# to Date (locale already set to English at the top of the script)
+ps_clean <- ps_clean %>%
+  mutate(Last.Updated = as.Date(Last.Updated, format = "%B %d, %Y"))
+
+sum(is.na(ps_clean$Last.Updated))
+range(ps_clean$Last.Updated, na.rm = TRUE)
+
+# derived variables
+ps_clean <- ps_clean %>%
+  mutate(
+    Update_Year  = year(Last.Updated),
+    Update_Month = month(Last.Updated, label = TRUE),
+    Days_Since_Update = as.numeric(Sys.Date() - Last.Updated)
+  )
+
+
+## ================================================================
+## CURRENT.VER COLUMN CLEANING
+## ================================================================
+
+class(ps_clean$Current.Ver)
+sum(is.na(ps_clean$Current.Ver))
+sum(ps_clean$Current.Ver == "Varies with device", na.rm = TRUE)
+
+# whitespace
+ps_clean$Current.Ver <- str_trim(ps_clean$Current.Ver)
+
+# flag "Varies with device"
+ps_clean <- ps_clean %>%
+  mutate(Current_Ver_Varies = Current.Ver == "Varies with device")
+
+# major version number
+ps_clean <- ps_clean %>%
+  mutate(Current_Ver_Major = str_extract(Current.Ver, "^[0-9]+"))
+
+
+## ================================================================
+## ANDROID.VER COLUMN CLEANING
+## ================================================================
+
+class(ps_clean$Android.Ver)
+sum(is.na(ps_clean$Android.Ver))
+sum(ps_clean$Android.Ver == "Varies with device", na.rm = TRUE)
+
+# missing values
+ps_clean %>% filter(is.na(Android.Ver) | Android.Ver == "") %>% select(App, Android.Ver)
+
+# whitespace
+ps_clean$Android.Ver <- str_trim(ps_clean$Android.Ver)
+
+# flag "Varies with device"
+ps_clean <- ps_clean %>%
+  mutate(Android_Ver_Varies = Android.Ver == "Varies with device")
+
+# minimum version
+ps_clean <- ps_clean %>%
+  mutate(Android_Ver_Min = str_extract(Android.Ver, "^[0-9]+\\.?[0-9]*"))
+
+
+## ================================================================
+## FINAL CHECK
+## ================================================================
+
+str(ps_clean)
+summary(ps_clean)
+sum(is.na(ps_clean))
+dim(ps_clean)
+
+
+```
+
+
+
+
+## 
+
+```{r ,error=FALSE, message=FALSE,warning=FALSE, echo=TRUE}
+
+
+
+
+```
+
+
+
+## 
+
+```{r ,error=FALSE, message=FALSE,warning=FALSE, echo=TRUE}
+
+
+
+
+```
+
+
+
+
+## 
+
+```{r ,error=FALSE, message=FALSE,warning=FALSE, echo=TRUE}
+
+
+
+
+```
+
+
+
+
+## 
+
+```{r ,error=FALSE, message=FALSE,warning=FALSE, echo=TRUE}
+
+
+
+
+```
